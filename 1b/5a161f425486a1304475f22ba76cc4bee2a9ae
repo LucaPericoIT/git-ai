@@ -1,0 +1,21 @@
+src/ci/gitlab.rs
+  s_84e4215e269fb7::t_57dac48935b3dd 1,408,445-459,486-698,1137-1197
+tests/integration/ci_squash_rebase.rs
+  s_84e4215e269fb7::t_b421f4081cc297 1885-1974
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1b5a161f425486a1304475f22ba76cc4bee2a9ae",
+  "prompts": {},
+  "sessions": {
+    "s_84e4215e269fb7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "046a07dd-2f2e-474e-b9db-f8a65c4c9e79",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Luca Perico <luca.perico90@gmail.com>"
+    }
+  }
+}
