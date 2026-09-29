@@ -1,0 +1,21 @@
+src/ci/workflow_templates/gitlab.yaml
+  s_c793f69f7c676a::t_3cea46850b4d84 1-2,6-7,19,24-27
+src/commands/ci_handlers.rs
+  s_c793f69f7c676a::t_11afaa7eb59635 3,186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "34481a82b4f93d13c81d1cb1e889210f7b932186",
+  "prompts": {},
+  "sessions": {
+    "s_c793f69f7c676a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9cc16772-60fc-44ae-b56e-cfa633b2d066",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Luca Perico <luca.perico90@gmail.com>"
+    }
+  }
+}
