@@ -381,7 +381,7 @@ fn redact_url_credentials(text: &str) -> String {
     while let Some(scheme_at) = rest.find("://") {
         let after_scheme = scheme_at + 3;
         let authority_end = rest[after_scheme..]
-            .find(['/', ' ', '"', '\''])
+            .find(|c: char| c == '/' || c == '"' || c == '\'' || c.is_whitespace())
             .map(|i| after_scheme + i)
             .unwrap_or(rest.len());
         let authority = &rest[after_scheme..authority_end];
@@ -762,7 +762,7 @@ fn recover_rewritten_mr_notes(
     };
 
     let mut rewrote_any = false;
-    for pair in chain.windows(2) {
+    'hops: for pair in chain.windows(2) {
         let (previous, current) = (&pair[0], &pair[1]);
 
         for (sha, label) in [
@@ -780,7 +780,7 @@ fn recover_rewritten_mr_notes(
                      stopping recovery for MR !{}",
                     label, sha, e, iid
                 );
-                return Ok(());
+                break 'hops;
             }
         }
 
@@ -1588,6 +1588,14 @@ mod tests {
     #[test]
     fn test_redact_url_credentials_handles_several_urls() {
         let text = "https://oauth2:aaa@host/x.git and https://gitlab-ci-token:bbb@host/y.git";
+        let redacted = redact_url_credentials(text);
+        assert!(!redacted.contains("aaa"), "{}", redacted);
+        assert!(!redacted.contains("bbb"), "{}", redacted);
+    }
+
+    #[test]
+    fn test_redact_url_credentials_stops_authority_at_newline() {
+        let text = "remote: https://oauth2:aaa@host\nfatal: https://gitlab-ci-token:bbb@host/y.git";
         let redacted = redact_url_credentials(text);
         assert!(!redacted.contains("aaa"), "{}", redacted);
         assert!(!redacted.contains("bbb"), "{}", redacted);
