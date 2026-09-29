@@ -1,0 +1,19 @@
+src/commands/ci_handlers.rs
+  s_c793f69f7c676a::t_d9af951c9cf33c 138,143-146,398-399,458-459,461
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "68476a86b6a4fd2386243e5da1a69621de9ec684",
+  "prompts": {},
+  "sessions": {
+    "s_c793f69f7c676a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9cc16772-60fc-44ae-b56e-cfa633b2d066",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Luca Perico <luca.perico90@gmail.com>"
+    }
+  }
+}
