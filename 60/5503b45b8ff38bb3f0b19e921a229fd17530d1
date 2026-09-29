@@ -1,0 +1,29 @@
+src/ci/gitlab.rs
+  s_c793f69f7c676a::t_55896ceb802119 462,471,484,491,540,548
+src/commands/ci_handlers.rs
+  s_3a280a11feb964::t_465d839821674a 139-140,143-165,172,183,398-399
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "605503b45b8ff38bb3f0b19e921a229fd17530d1",
+  "prompts": {},
+  "sessions": {
+    "s_3a280a11feb964": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ceec48ab-5625-4c16-9c24-73ec7de4b8e2",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Luca Perico <luca.perico90@gmail.com>"
+    },
+    "s_c793f69f7c676a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9cc16772-60fc-44ae-b56e-cfa633b2d066",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Luca Perico <luca.perico90@gmail.com>"
+    }
+  }
+}
