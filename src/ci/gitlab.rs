@@ -1,7 +1,8 @@
 use crate::ci::ci_context::{CiContext, CiEvent, CiRunOptions, CiRunResult};
 use crate::error::GitAiError;
+use crate::git::refs::{AI_AUTHORSHIP_FORK_TRACKING_REF, copy_missing_notes_for_commits_from_ref};
 use crate::git::repository::exec_git;
-use crate::git::repository::find_repository_in_path;
+use crate::git::repository::{CommitRange, Repository, find_repository_in_path};
 use chrono::{Duration, Utc};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -310,10 +311,33 @@ impl GitLabApi {
     }
 
     /// Diff versions for an MR, newest first.
+    ///
+    /// Paginated: the *oldest* page holds the revisions that still carry the
+    /// original notes, so stopping at the first page would silently recover
+    /// nothing for a long-lived MR. Past the cap the history is reported as
+    /// unreadable rather than replayed from a truncated middle.
     fn mr_versions(&self, iid: u64) -> Result<Vec<GitLabMergeRequestVersion>, String> {
-        let body =
-            self.get_project_json(&format!("/merge_requests/{}/versions?per_page=100", iid))?;
-        serde_json::from_str(&body).map_err(|e| format!("could not parse versions: {}", e))
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: usize = 20;
+
+        let mut all: Vec<GitLabMergeRequestVersion> = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let body = self.get_project_json(&format!(
+                "/merge_requests/{}/versions?per_page={}&page={}",
+                iid, PER_PAGE, page
+            ))?;
+            let versions: Vec<GitLabMergeRequestVersion> = serde_json::from_str(&body)
+                .map_err(|e| format!("could not parse versions: {}", e))?;
+            let page_len = versions.len();
+            all.extend(versions);
+            if page_len < PER_PAGE {
+                return Ok(all);
+            }
+        }
+        Err(format!(
+            "more than {} diff versions; refusing to replay a truncated history",
+            PER_PAGE * MAX_PAGES
+        ))
     }
 
     /// Clone URL of an arbitrary project, used to reach a fork's commits.
@@ -450,21 +474,28 @@ fn build_ci_clone_urls(server_url: &str, project_path: &str) -> CiCloneUrls {
 
 /// Attach the job token to a project URL served by this GitLab instance.
 ///
-/// The `replace` is a no-op for a URL on any other host, so a token cannot be
-/// sent to a third party even if the API returned an unexpected URL.
+/// The prefix has to end on an authority boundary: `https://gitlab.example.evil`
+/// starts with `https://gitlab.example` and would otherwise be handed the token.
 fn authenticate_project_url(url: String, server_url: &str) -> String {
     let scheme = if server_url.starts_with("https") {
         "https"
     } else {
         "http"
     };
+    let server_url = server_url.trim_end_matches('/');
     let server_host = server_url
         .trim_start_matches("https://")
         .trim_start_matches("http://");
+    let Some(path) = url.strip_prefix(server_url) else {
+        return url;
+    };
+    if !path.is_empty() && !path.starts_with('/') {
+        return url;
+    }
     match std::env::var("CI_JOB_TOKEN") {
-        Ok(job_token) => url.replace(
-            server_url,
-            &format!("{}://gitlab-ci-token:{}@{}", scheme, job_token, server_host),
+        Ok(job_token) => format!(
+            "{}://gitlab-ci-token:{}@{}{}",
+            scheme, job_token, server_host, path
         ),
         Err(_) => url,
     }
@@ -567,6 +598,39 @@ fn ensure_commit_fetched(
     ])
 }
 
+/// Commits a diff version introduced, falling back to its head alone when the
+/// recorded base is no longer resolvable in the clone.
+fn revision_commits(repo: &Repository, version: &GitLabMergeRequestVersion) -> Vec<String> {
+    let head = version.head_commit_sha.clone();
+    let Some(base) = version.base_commit_sha.clone() else {
+        return vec![head];
+    };
+    CommitRange::new_infer_refname(repo, base, head.clone(), None)
+        .map(|range| range.all_commits())
+        .unwrap_or_else(|_| vec![head])
+}
+
+/// Copy the fork's notes for a pre-rewrite revision into the clone's own
+/// authorship ref.
+///
+/// A fork MR's attribution exists only in the fork, and the merge handler
+/// imports it scoped to the final head, so without this every hop would replay a
+/// revision that looks unattributed.
+fn import_fork_notes_for_revision(repo: &Repository, version: &GitLabMergeRequestVersion) {
+    let commits = revision_commits(repo, version);
+    match copy_missing_notes_for_commits_from_ref(repo, AI_AUTHORSHIP_FORK_TRACKING_REF, &commits) {
+        Ok(0) => {}
+        Ok(copied) => println!(
+            "[GitLab CI] Imported {} fork authorship note(s) for pre-rewrite revision {}",
+            copied, version.head_commit_sha
+        ),
+        Err(e) => println!(
+            "[GitLab CI] Could not import fork authorship notes for revision {}: {}",
+            version.head_commit_sha, e
+        ),
+    }
+}
+
 /// Notes stay local: the caller pushes once, after every hop has landed.
 fn replay_rewrite_hop(
     clone_dir: &str,
@@ -596,6 +660,19 @@ fn replay_rewrite_hop(
     })
 }
 
+/// What `recover_rewritten_mr_notes` needs to know about the merge request.
+struct RewriteRecovery<'a> {
+    clone_dir: &'a str,
+    iid: u64,
+    merge_commit_sha: &'a str,
+    target_branch: &'a str,
+    /// Where pre-rewrite commits are fetched from: the fork for a fork MR,
+    /// since the target project never had them.
+    fetch_url: &'a str,
+    fork_clone_url: Option<&'a str>,
+    skip_push: bool,
+}
+
 /// Walk an already-merged MR's diff-version history and replay every rewrite of
 /// its source branch, so the notes written against the *original* commits end up
 /// on the commits the merge actually consumed.
@@ -607,16 +684,22 @@ fn replay_rewrite_hop(
 /// the only record of the pre-rewrite SHAs, and it outlives the merge.
 ///
 /// Best-effort throughout: a hop whose commits the server will no longer serve,
-/// or that is not a clean rebase, is skipped rather than failing the run.
+/// or that is not a clean rebase, is skipped rather than failing the run. The
+/// push is the exception - the recovered notes exist only in a clone that
+/// teardown deletes, so a silent failure there is unrecoverable attribution.
 fn recover_rewritten_mr_notes(
     api: &GitLabApi,
-    clone_dir: &str,
-    iid: u64,
-    merge_commit_sha: &str,
-    target_branch: &str,
-    fetch_url: &str,
-    skip_push: bool,
-) {
+    recovery: RewriteRecovery<'_>,
+) -> Result<(), GitAiError> {
+    let RewriteRecovery {
+        clone_dir,
+        iid,
+        merge_commit_sha,
+        target_branch,
+        fetch_url,
+        fork_clone_url,
+        skip_push,
+    } = recovery;
     let versions = match api.mr_versions(iid) {
         Ok(versions) => versions,
         Err(e) => {
@@ -624,13 +707,13 @@ fn recover_rewritten_mr_notes(
                 "[GitLab CI] Could not read MR !{} diff versions ({}); skipping rebase recovery",
                 iid, e
             );
-            return;
+            return Ok(());
         }
     };
 
     let chain = revision_chain_from_versions(&versions);
     if chain.len() < 2 {
-        return;
+        return Ok(());
     }
 
     let repo = match find_repository_in_path(clone_dir) {
@@ -640,21 +723,21 @@ fn recover_rewritten_mr_notes(
                 "[GitLab CI] Could not open clone for rebase recovery: {}",
                 e
             );
-            return;
+            return Ok(());
         }
     };
 
     if let Err(e) = crate::git::sync_authorship::fetch_authorship_notes(&repo, "origin") {
         println!(
             "[GitLab CI] Could not fetch authorship notes for rebase recovery: {}",
-            e
+            redact_url_credentials(&e.to_string())
         );
-        return;
+        return Ok(());
     }
 
     // Already carried forward on an earlier run of this job - nothing to redo.
     if crate::git::notes_api::read_authorship_v3(&repo, merge_commit_sha).is_ok() {
-        return;
+        return Ok(());
     }
 
     println!(
@@ -663,6 +746,20 @@ fn recover_rewritten_mr_notes(
         iid,
         chain.len() - 1
     );
+
+    let fork_notes_available = match fork_clone_url {
+        Some(fork_url) => match CiContext::fetch_fork_notes(&repo, fork_url) {
+            Ok(available) => available,
+            Err(e) => {
+                println!(
+                    "[GitLab CI] Could not fetch fork authorship notes for rebase recovery: {}",
+                    redact_url_credentials(&e.to_string())
+                );
+                false
+            }
+        },
+        None => false,
+    };
 
     let mut rewrote_any = false;
     for pair in chain.windows(2) {
@@ -683,8 +780,12 @@ fn recover_rewritten_mr_notes(
                      stopping recovery for MR !{}",
                     label, sha, e, iid
                 );
-                return;
+                return Ok(());
             }
+        }
+
+        if fork_notes_available {
+            import_fork_notes_for_revision(&repo, previous);
         }
 
         match replay_rewrite_hop(clone_dir, previous, current, target_branch, fetch_url) {
@@ -713,7 +814,10 @@ fn recover_rewritten_mr_notes(
             Err(e) => {
                 println!(
                     "[GitLab CI] Rewrite hop {} -> {} failed ({}); stopping recovery for MR !{}",
-                    previous.head_commit_sha, current.head_commit_sha, e, iid
+                    previous.head_commit_sha,
+                    current.head_commit_sha,
+                    redact_url_credentials(&e.to_string()),
+                    iid
                 );
                 break;
             }
@@ -728,11 +832,14 @@ fn recover_rewritten_mr_notes(
         && !skip_push
         && let Err(e) = repo.push_authorship("origin")
     {
-        println!(
-            "[GitLab CI] Could not push recovered attribution for MR !{}: {}",
-            iid, e
-        );
+        return Err(GitAiError::Generic(format!(
+            "could not push recovered attribution for MR !{}: {}",
+            iid,
+            redact_url_credentials(&e.to_string())
+        )));
     }
+
+    Ok(())
 }
 
 /// Query GitLab API for the MR that produced the current commit and build a
@@ -879,13 +986,16 @@ pub fn get_gitlab_ci_context(skip_push: bool) -> Result<Option<CiContext>, GitAi
     // have it.
     recover_rewritten_mr_notes(
         &api,
-        &clone_dir,
-        mr.iid,
-        &effective_merge_sha,
-        &mr.target_branch,
-        fork_clone_url.as_deref().unwrap_or(&urls.fetch),
-        skip_push,
-    );
+        RewriteRecovery {
+            clone_dir: &clone_dir,
+            iid: mr.iid,
+            merge_commit_sha: &effective_merge_sha,
+            target_branch: &mr.target_branch,
+            fetch_url: fork_clone_url.as_deref().unwrap_or(&urls.fetch),
+            fork_clone_url: fork_clone_url.as_deref(),
+            skip_push,
+        },
+    )?;
 
     Ok(Some(CiContext {
         repo,
@@ -1600,6 +1710,15 @@ mod tests {
         );
         assert_eq!(foreign, "https://evil.example/fork/project.git");
 
+        let lookalike = authenticate_project_url(
+            "https://gitlab.example.evil.test/fork/project.git".to_string(),
+            "https://gitlab.example",
+        );
+        assert_eq!(
+            lookalike, "https://gitlab.example.evil.test/fork/project.git",
+            "a host that merely starts with the server URL must not get the token"
+        );
+
         let own = authenticate_project_url(
             "https://gitlab.example/fork/project.git".to_string(),
             "https://gitlab.example",
@@ -1697,6 +1816,71 @@ mod tests {
         );
     }
 
+    // ---- Diff version pagination ----
+
+    fn versions_page(shas: &[String]) -> String {
+        let entries: Vec<String> = shas
+            .iter()
+            .map(|sha| {
+                format!(
+                    r#"{{"head_commit_sha": "{}", "base_commit_sha": "base"}}"#,
+                    sha
+                )
+            })
+            .collect();
+        format!("[{}]", entries.join(","))
+    }
+
+    #[test]
+    fn test_mr_versions_walks_every_page() {
+        let mut server = mockito::Server::new();
+        let first_page: Vec<String> = (0..100).map(|i| format!("head{}", i)).collect();
+        let page1 = server
+            .mock(
+                "GET",
+                "/projects/123/merge_requests/7/versions?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(versions_page(&first_page))
+            .create();
+        let page2 = server
+            .mock(
+                "GET",
+                "/projects/123/merge_requests/7/versions?per_page=100&page=2",
+            )
+            .with_status(200)
+            .with_body(versions_page(&["oldest".to_string()]))
+            .create();
+
+        let versions = api_for(&server.url(), "PRIVATE-TOKEN", "tok")
+            .mr_versions(7)
+            .unwrap();
+        page1.assert();
+        page2.assert();
+        assert_eq!(versions.len(), 101);
+        assert_eq!(versions.last().unwrap().head_commit_sha, "oldest");
+    }
+
+    #[test]
+    fn test_mr_versions_stops_on_the_first_short_page() {
+        let mut server = mockito::Server::new();
+        let page1 = server
+            .mock(
+                "GET",
+                "/projects/123/merge_requests/7/versions?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(versions_page(&["a".to_string(), "b".to_string()]))
+            .expect(1)
+            .create();
+
+        let versions = api_for(&server.url(), "PRIVATE-TOKEN", "tok")
+            .mr_versions(7)
+            .unwrap();
+        page1.assert();
+        assert_eq!(versions.len(), 2);
+    }
+
     // ---- Rebase recovery: the paths that bail before touching the clone ----
     //
     // The clone directory below does not exist, so these also prove recovery
@@ -1708,20 +1892,24 @@ mod tests {
         let mock = server
             .mock(
                 "GET",
-                "/projects/123/merge_requests/7/versions?per_page=100",
+                "/projects/123/merge_requests/7/versions?per_page=100&page=1",
             )
             .with_status(500)
             .create();
 
         recover_rewritten_mr_notes(
             &api_for(&server.url(), "PRIVATE-TOKEN", "tok"),
-            "/nonexistent/git-ai-recovery-test",
-            7,
-            "merge-sha",
-            "main",
-            "https://unreachable.invalid/x.git",
-            true,
-        );
+            RewriteRecovery {
+                clone_dir: "/nonexistent/git-ai-recovery-test",
+                iid: 7,
+                merge_commit_sha: "merge-sha",
+                target_branch: "main",
+                fetch_url: "https://unreachable.invalid/x.git",
+                fork_clone_url: None,
+                skip_push: true,
+            },
+        )
+        .unwrap();
         mock.assert();
     }
 
@@ -1731,7 +1919,7 @@ mod tests {
         let mock = server
             .mock(
                 "GET",
-                "/projects/123/merge_requests/7/versions?per_page=100",
+                "/projects/123/merge_requests/7/versions?per_page=100&page=1",
             )
             .with_status(200)
             .with_body(r#"[{"head_commit_sha": "only", "base_commit_sha": "base"}]"#)
@@ -1739,13 +1927,17 @@ mod tests {
 
         recover_rewritten_mr_notes(
             &api_for(&server.url(), "PRIVATE-TOKEN", "tok"),
-            "/nonexistent/git-ai-recovery-test",
-            7,
-            "merge-sha",
-            "main",
-            "https://unreachable.invalid/x.git",
-            true,
-        );
+            RewriteRecovery {
+                clone_dir: "/nonexistent/git-ai-recovery-test",
+                iid: 7,
+                merge_commit_sha: "merge-sha",
+                target_branch: "main",
+                fetch_url: "https://unreachable.invalid/x.git",
+                fork_clone_url: None,
+                skip_push: true,
+            },
+        )
+        .unwrap();
         mock.assert();
     }
 }
