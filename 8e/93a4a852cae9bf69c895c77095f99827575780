@@ -1,0 +1,19 @@
+src/ci/gitlab.rs
+  s_3ee646816949c8::t_ef8b5b5d1d05a6 384,765,783,1596-1603
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8e93a4a852cae9bf69c895c77095f99827575780",
+  "prompts": {},
+  "sessions": {
+    "s_3ee646816949c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a86b4279-4595-445a-bde9-f0121eb360a6",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Luca Perico <luca.perico90@gmail.com>"
+    }
+  }
+}
