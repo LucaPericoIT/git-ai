@@ -503,12 +503,17 @@ fn authenticate_project_url(url: String, server_url: &str) -> String {
 
 /// GitLab keeps an MR's commits at `refs/merge-requests/:iid/head` even after
 /// the source branch is deleted, which is the only way a post-merge job can
-/// still reach them.
+/// still reach them by ref.
+///
+/// GitLab later prunes that ref for some merged MRs while still serving the
+/// commit itself, so when the ref is gone the MR's head is fetched by SHA
+/// instead.
 fn prepare_ci_clone(
     clone_dir: &str,
     urls: &CiCloneUrls,
     target_branch: &str,
     iid: u64,
+    head_sha: &str,
 ) -> Result<(), GitAiError> {
     println!("[GitLab CI] Cloning repository...");
     exec_git_redacted(&[
@@ -533,13 +538,31 @@ fn prepare_ci_clone(
         "[GitLab CI] Fetching MR commits from refs/merge-requests/{}/head...",
         iid
     );
-    exec_git_redacted(&[
+    let mr_ref = format!("refs/gitlab/mr/{}", iid);
+    let by_ref = exec_git_redacted(&[
         "-C".to_string(),
         clone_dir.to_string(),
         "fetch".to_string(),
         urls.fetch.clone(),
-        format!("refs/merge-requests/{}/head:refs/gitlab/mr/{}", iid, iid),
-    ])
+        format!("refs/merge-requests/{}/head:{}", iid, mr_ref),
+    ]);
+    let Err(ref_err) = by_ref else {
+        return Ok(());
+    };
+    if head_sha.is_empty() {
+        return Err(ref_err);
+    }
+
+    println!(
+        "[GitLab CI] refs/merge-requests/{}/head unavailable; fetching MR head {} by SHA",
+        iid, head_sha
+    );
+    ensure_commit_fetched(clone_dir, head_sha, &urls.fetch, &mr_ref).map_err(|sha_err| {
+        GitAiError::Generic(format!(
+            "could not fetch MR !{} head: by ref ({}); by SHA {} ({})",
+            iid, ref_err, head_sha, sha_err
+        ))
+    })
 }
 
 /// Distinct source-branch heads for an MR, oldest first.
@@ -948,7 +971,7 @@ pub fn get_gitlab_ci_context(skip_push: bool) -> Result<Option<CiContext>, GitAi
 
     let clone_dir = "git-ai-ci-clone".to_string();
     let urls = build_ci_clone_urls(&server_url, &project_path);
-    prepare_ci_clone(&clone_dir, &urls, &mr.target_branch, mr.iid)?;
+    prepare_ci_clone(&clone_dir, &urls, &mr.target_branch, mr.iid, &mr.sha)?;
 
     let repo = find_repository_in_path(&clone_dir)?;
 
@@ -1806,6 +1829,84 @@ mod tests {
         )
         .unwrap_err();
         assert!(!err.to_string().contains("super-secret"), "{}", err);
+    }
+
+    // ---- Preparing the CI clone ----
+
+    fn git_in(path: &str, args: &[&str]) -> String {
+        let mut full = vec!["-C".to_string(), path.to_string()];
+        full.extend(args.iter().map(|a| a.to_string()));
+        let out = exec_git(&full).unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A remote with one commit on its default branch plus a later commit that
+    /// no branch points at, the shape an MR head is left in once GitLab prunes
+    /// `refs/merge-requests/:iid/head`.
+    fn remote_with_unreferenced_head() -> (tempfile::TempDir, String, String, String) {
+        let (dir, path, _base) = init_repo_with_commit();
+        let target = git_in(&path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        git_in(&path, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.path().join("b.txt"), "y").unwrap();
+        git_in(&path, &["add", "."]);
+        git_in(
+            &path,
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "head"],
+        );
+        let head = git_in(&path, &["rev-parse", "HEAD"]);
+        git_in(&path, &["checkout", "-q", &target]);
+        git_in(&path, &["branch", "-q", "-D", "feature"]);
+        git_in(&path, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+        (dir, path, target, head)
+    }
+
+    fn file_urls(remote: &str) -> CiCloneUrls {
+        let url = format!("file://{}", remote);
+        CiCloneUrls {
+            fetch: url.clone(),
+            push: url,
+        }
+    }
+
+    #[test]
+    fn test_prepare_ci_clone_uses_the_mr_ref_when_present() {
+        let (_remote_dir, remote, target, head) = remote_with_unreferenced_head();
+        git_in(
+            &remote,
+            &["update-ref", "refs/merge-requests/7/head", &head],
+        );
+        let work = tempfile::tempdir().unwrap();
+        let clone = work.path().join("clone").to_str().unwrap().to_string();
+
+        prepare_ci_clone(&clone, &file_urls(&remote), &target, 7, &head).unwrap();
+
+        assert_eq!(git_in(&clone, &["rev-parse", "refs/gitlab/mr/7"]), head);
+    }
+
+    #[test]
+    fn test_prepare_ci_clone_fetches_head_by_sha_when_mr_ref_is_pruned() {
+        let (_remote_dir, remote, target, head) = remote_with_unreferenced_head();
+        let work = tempfile::tempdir().unwrap();
+        let clone = work.path().join("clone").to_str().unwrap().to_string();
+
+        prepare_ci_clone(&clone, &file_urls(&remote), &target, 7, &head).unwrap();
+
+        assert_eq!(git_in(&clone, &["rev-parse", "refs/gitlab/mr/7"]), head);
+    }
+
+    #[test]
+    fn test_prepare_ci_clone_reports_both_failures_when_head_is_unreachable() {
+        let (_remote_dir, remote, target, _head) = remote_with_unreferenced_head();
+        let work = tempfile::tempdir().unwrap();
+        let clone = work.path().join("clone").to_str().unwrap().to_string();
+        let missing = "0123456789012345678901234567890123456789";
+
+        let err = prepare_ci_clone(&clone, &file_urls(&remote), &target, 7, missing)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("by ref"), "{}", err);
+        assert!(err.contains(missing), "{}", err);
     }
 
     #[test]
