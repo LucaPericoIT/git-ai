@@ -507,13 +507,15 @@ fn authenticate_project_url(url: String, server_url: &str) -> String {
 ///
 /// GitLab later prunes that ref for some merged MRs while still serving the
 /// commit itself, so when the ref is gone the MR's head is fetched by SHA
-/// instead.
+/// instead: from the target project, then from the fork for a fork MR, whose
+/// head may exist only there.
 fn prepare_ci_clone(
     clone_dir: &str,
     urls: &CiCloneUrls,
     target_branch: &str,
     iid: u64,
     head_sha: &str,
+    fork_fetch_url: Option<&str>,
 ) -> Result<(), GitAiError> {
     println!("[GitLab CI] Cloning repository...");
     exec_git_redacted(&[
@@ -557,10 +559,25 @@ fn prepare_ci_clone(
         "[GitLab CI] refs/merge-requests/{}/head unavailable; fetching MR head {} by SHA",
         iid, head_sha
     );
-    ensure_commit_fetched(clone_dir, head_sha, &urls.fetch, &mr_ref).map_err(|sha_err| {
-        GitAiError::Generic(format!(
+    let target_err = match ensure_commit_fetched(clone_dir, head_sha, &urls.fetch, &mr_ref) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    let Some(fork_url) = fork_fetch_url else {
+        return Err(GitAiError::Generic(format!(
             "could not fetch MR !{} head: by ref ({}); by SHA {} ({})",
-            iid, ref_err, head_sha, sha_err
+            iid, ref_err, head_sha, target_err
+        )));
+    };
+
+    println!(
+        "[GitLab CI] MR head {} not served by the target project; fetching it from the fork",
+        head_sha
+    );
+    ensure_commit_fetched(clone_dir, head_sha, fork_url, &mr_ref).map_err(|fork_err| {
+        GitAiError::Generic(format!(
+            "could not fetch MR !{} head: by ref ({}); by SHA {} from target ({}) and fork ({})",
+            iid, ref_err, head_sha, target_err, fork_err
         ))
     })
 }
@@ -971,7 +988,14 @@ pub fn get_gitlab_ci_context(skip_push: bool) -> Result<Option<CiContext>, GitAi
 
     let clone_dir = "git-ai-ci-clone".to_string();
     let urls = build_ci_clone_urls(&server_url, &project_path);
-    prepare_ci_clone(&clone_dir, &urls, &mr.target_branch, mr.iid, &mr.sha)?;
+    prepare_ci_clone(
+        &clone_dir,
+        &urls,
+        &mr.target_branch,
+        mr.iid,
+        &mr.sha,
+        fork_clone_url.as_deref(),
+    )?;
 
     let repo = find_repository_in_path(&clone_dir)?;
 
@@ -1878,7 +1902,7 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let clone = work.path().join("clone").to_str().unwrap().to_string();
 
-        prepare_ci_clone(&clone, &file_urls(&remote), &target, 7, &head).unwrap();
+        prepare_ci_clone(&clone, &file_urls(&remote), &target, 7, &head, None).unwrap();
 
         assert_eq!(git_in(&clone, &["rev-parse", "refs/gitlab/mr/7"]), head);
     }
@@ -1889,9 +1913,81 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let clone = work.path().join("clone").to_str().unwrap().to_string();
 
-        prepare_ci_clone(&clone, &file_urls(&remote), &target, 7, &head).unwrap();
+        prepare_ci_clone(&clone, &file_urls(&remote), &target, 7, &head, None).unwrap();
 
         assert_eq!(git_in(&clone, &["rev-parse", "refs/gitlab/mr/7"]), head);
+    }
+
+    /// A target project cloned from the fork, so it lacks the fork's unreferenced head.
+    fn target_without_fork_head(fork: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("target.git").to_str().unwrap().to_string();
+        exec_git(&[
+            "clone".to_string(),
+            "-q".to_string(),
+            "--bare".to_string(),
+            format!("file://{}", fork),
+            path.clone(),
+        ])
+        .unwrap();
+        git_in(&path, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+        (dir, path)
+    }
+
+    #[test]
+    fn test_prepare_ci_clone_fetches_a_pruned_fork_head_from_the_fork() {
+        let (_fork_dir, fork, target_branch, head) = remote_with_unreferenced_head();
+        let (_target_dir, target) = target_without_fork_head(&fork);
+        assert!(
+            exec_git(&[
+                "-C".to_string(),
+                target.clone(),
+                "cat-file".to_string(),
+                "-e".to_string(),
+                head.clone(),
+            ])
+            .is_err(),
+            "the target must not hold the fork head, or this test bypasses the fork path"
+        );
+        let fork_url = format!("file://{}", fork);
+        let work = tempfile::tempdir().unwrap();
+        let clone = work.path().join("clone").to_str().unwrap().to_string();
+
+        prepare_ci_clone(
+            &clone,
+            &file_urls(&target),
+            &target_branch,
+            7,
+            &head,
+            Some(&fork_url),
+        )
+        .unwrap();
+
+        assert_eq!(git_in(&clone, &["rev-parse", "refs/gitlab/mr/7"]), head);
+    }
+
+    #[test]
+    fn test_prepare_ci_clone_reports_target_and_fork_failures() {
+        let (_fork_dir, fork, target_branch, _head) = remote_with_unreferenced_head();
+        let (_target_dir, target) = target_without_fork_head(&fork);
+        let fork_url = format!("file://{}", fork);
+        let work = tempfile::tempdir().unwrap();
+        let clone = work.path().join("clone").to_str().unwrap().to_string();
+        let missing = "0123456789012345678901234567890123456789";
+
+        let err = prepare_ci_clone(
+            &clone,
+            &file_urls(&target),
+            &target_branch,
+            7,
+            missing,
+            Some(&fork_url),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("from target"), "{}", err);
+        assert!(err.contains("and fork"), "{}", err);
     }
 
     #[test]
@@ -1901,7 +1997,7 @@ mod tests {
         let clone = work.path().join("clone").to_str().unwrap().to_string();
         let missing = "0123456789012345678901234567890123456789";
 
-        let err = prepare_ci_clone(&clone, &file_urls(&remote), &target, 7, missing)
+        let err = prepare_ci_clone(&clone, &file_urls(&remote), &target, 7, missing, None)
             .unwrap_err()
             .to_string();
 
