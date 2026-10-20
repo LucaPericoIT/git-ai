@@ -1723,6 +1723,7 @@ fn test_ci_squash_merge_not_misclassified_as_rebase_on_linear_main() {
         skip_fetch_fork_notes: true,
         skip_fetch_sync_refs: false,
         skip_push: true,
+        recompute_existing: false,
     })
     .expect("CI merge rewrite should succeed");
 
@@ -1739,6 +1740,122 @@ fn test_ci_squash_merge_not_misclassified_as_rebase_on_linear_main() {
         repo.read_authorship_note(&b3_sha).is_none(),
         "#1473 regression: unrelated base commit B3 ({b3_sha}) must not receive a note"
     );
+}
+
+#[test]
+fn test_ci_squash_merge_recomputes_a_partial_existing_note() {
+    use git_ai::ci::ci_context::{CiContext, CiEvent, CiRunOptions, CiRunResult};
+
+    let repo = TestRepo::new();
+    let base_sha = setup_main(&repo);
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    let mut api = repo.filename("api.js");
+    let mut view = repo.filename("view.js");
+    api.set_contents(crate::lines!["export const handler = () => 'ok';".ai()]);
+    view.set_contents(crate::lines!["export const View = () => handler();".ai()]);
+    let head_sha = repo
+        .stage_all_and_commit("add ai feature files")
+        .unwrap()
+        .commit_sha;
+
+    let merge_sha = squash_feature_with_raw_git(&repo, "squash feature files");
+    assert_ci_rewrite_succeeded(&run_ci_local_merge(&repo, &merge_sha, &head_sha, &base_sha));
+
+    let mut partial =
+        AuthorshipLog::deserialize_from_string(&repo.read_authorship_note(&merge_sha).unwrap())
+            .unwrap();
+    partial.attestations.retain(|a| a.file_path == "api.js");
+    let git_ai_repo = || {
+        GitAiRepository::find_repository_in_path(repo.path().to_str().unwrap())
+            .expect("Failed to find repository")
+    };
+    write_note(
+        &git_ai_repo(),
+        &merge_sha,
+        &partial.serialize_to_string().unwrap(),
+    )
+    .unwrap();
+
+    let run = |recompute_existing: bool| {
+        CiContext::with_repository(
+            git_ai_repo(),
+            CiEvent::Merge {
+                merge_commit_sha: merge_sha.clone(),
+                head_ref: "feature".to_string(),
+                head_sha: head_sha.clone(),
+                base_ref: "main".to_string(),
+                base_sha: base_sha.clone(),
+                fork_clone_url: None,
+            },
+        )
+        .run_with_options(CiRunOptions {
+            skip_fetch_notes: true,
+            skip_fetch_base: true,
+            skip_fetch_fork_notes: true,
+            skip_fetch_sync_refs: false,
+            skip_push: true,
+            recompute_existing,
+        })
+        .expect("CI merge run should succeed")
+    };
+
+    assert!(matches!(run(false), CiRunResult::AlreadyExists { .. }));
+    assert_eq!(authorship_files(&repo, &merge_sha), vec!["api.js"]);
+
+    assert!(matches!(run(true), CiRunResult::AuthorshipRewritten { .. }));
+    let mut files = authorship_files(&repo, &merge_sha);
+    files.sort();
+    assert_eq!(files, vec!["api.js", "view.js"]);
+}
+
+#[test]
+fn test_ci_squash_merge_recompute_keeps_lines_only_the_existing_note_has() {
+    use git_ai::ci::ci_context::{CiContext, CiEvent, CiRunOptions};
+
+    let repo = TestRepo::new();
+    let base_sha = setup_main(&repo);
+
+    repo.git(&["checkout", "-b", "feature"]).unwrap();
+    let mut api = repo.filename("api.js");
+    api.set_contents(crate::lines!["export const handler = () => 'ok';".ai()]);
+    let head_sha = repo.stage_all_and_commit("add ai api").unwrap().commit_sha;
+
+    let merge_sha = squash_feature_with_raw_git(&repo, "squash feature");
+    assert_ci_rewrite_succeeded(&run_ci_local_merge(&repo, &merge_sha, &head_sha, &base_sha));
+    let existing = repo.read_authorship_note(&merge_sha).unwrap();
+
+    repo.git_og(&["notes", "--ref=ai", "remove", &head_sha])
+        .unwrap();
+    let git_ai_repo = GitAiRepository::find_repository_in_path(repo.path().to_str().unwrap())
+        .expect("Failed to find repository");
+    CiContext::with_repository(
+        git_ai_repo,
+        CiEvent::Merge {
+            merge_commit_sha: merge_sha.clone(),
+            head_ref: "feature".to_string(),
+            head_sha: head_sha.clone(),
+            base_ref: "main".to_string(),
+            base_sha: base_sha.clone(),
+            fork_clone_url: None,
+        },
+    )
+    .run_with_options(CiRunOptions {
+        skip_fetch_notes: true,
+        skip_fetch_base: true,
+        skip_fetch_fork_notes: true,
+        skip_fetch_sync_refs: false,
+        skip_push: true,
+        recompute_existing: true,
+    })
+    .expect("CI merge run should succeed");
+
+    let after =
+        AuthorshipLog::deserialize_from_string(&repo.read_authorship_note(&merge_sha).unwrap())
+            .unwrap();
+    let before = AuthorshipLog::deserialize_from_string(&existing).unwrap();
+    assert_eq!(after.attestations, before.attestations);
+    api.assert_lines_and_blame(crate::lines!["export const handler = () => 'ok';".ai()]);
 }
 
 crate::reuse_tests_in_worktree!(
@@ -1767,6 +1884,8 @@ crate::reuse_tests_in_worktree!(
     test_merge_after_unsynced_rebase_loses_attribution,
     test_sync_before_merge_preserves_attribution_across_rebase,
     test_chained_rebases_carry_attribution_to_the_merge,
+    test_ci_squash_merge_recomputes_a_partial_existing_note,
+    test_ci_squash_merge_recompute_keeps_lines_only_the_existing_note_has,
 );
 
 /// Reproduces the GitLab "Rebase" button pressed on an open MR: the source
