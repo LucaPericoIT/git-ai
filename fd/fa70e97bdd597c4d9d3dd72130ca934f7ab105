@@ -1,0 +1,25 @@
+src/ci/ci_context.rs
+  s_378fafc0a5084c::t_2f5d8cfa1f95e0 81-83,131-136
+src/commands/ci_handlers.rs
+  s_378fafc0a5084c::t_3870e3b71189d8 138-140,146,297,372,464-467
+tests/integration/ci_partial_clone.rs
+  s_378fafc0a5084c::t_cb5cd25217047c 82,153,235,327
+tests/integration/ci_squash_rebase.rs
+  s_378fafc0a5084c::t_aeeabace41b120 1726,1745-1860,1884-1885
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fdfa70e97bdd597c4d9d3dd72130ca934f7ab105",
+  "prompts": {},
+  "sessions": {
+    "s_378fafc0a5084c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4ec285de-0282-4ae4-9a42-7c3dba29715d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Luca Perico <luca.perico@qohash.com>"
+    }
+  }
+}
