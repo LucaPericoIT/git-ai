@@ -79,6 +79,7 @@ fn test_squash_merge_single_parent_not_on_base_ref() {
         skip_fetch_fork_notes: true,
         skip_fetch_sync_refs: false,
         skip_push: false,
+        recompute_existing: false,
     });
 
     // Should not fail with "No parent of commit" error
@@ -149,6 +150,7 @@ fn test_single_commit_rebase_parent_on_base_ref() {
         skip_fetch_fork_notes: true,
         skip_fetch_sync_refs: false,
         skip_push: false,
+        recompute_existing: false,
     });
 
     assert!(
@@ -230,6 +232,7 @@ fn test_multi_commit_squash_merge_single_parent() {
         skip_fetch_fork_notes: true,
         skip_fetch_sync_refs: false,
         skip_push: false,
+        recompute_existing: false,
     });
 
     assert!(
@@ -321,6 +324,7 @@ fn test_regular_two_parent_merge_skipped() {
         skip_fetch_fork_notes: true,
         skip_fetch_sync_refs: false,
         skip_push: false,
+        recompute_existing: false,
     });
 
     assert!(

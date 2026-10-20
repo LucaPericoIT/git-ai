@@ -697,6 +697,7 @@ fn replay_rewrite_hop(
         skip_fetch_fork_notes: true,
         skip_fetch_sync_refs: false,
         skip_push: true,
+        recompute_existing: false,
     })
 }
 
@@ -711,6 +712,7 @@ struct RewriteRecovery<'a> {
     fetch_url: &'a str,
     fork_clone_url: Option<&'a str>,
     skip_push: bool,
+    recompute_existing: bool,
 }
 
 /// Walk an already-merged MR's diff-version history and replay every rewrite of
@@ -739,6 +741,7 @@ fn recover_rewritten_mr_notes(
         fetch_url,
         fork_clone_url,
         skip_push,
+        recompute_existing,
     } = recovery;
     let versions = match api.mr_versions(iid) {
         Ok(versions) => versions,
@@ -776,7 +779,9 @@ fn recover_rewritten_mr_notes(
     }
 
     // Already carried forward on an earlier run of this job - nothing to redo.
-    if crate::git::notes_api::read_authorship_v3(&repo, merge_commit_sha).is_ok() {
+    if !recompute_existing
+        && crate::git::notes_api::read_authorship_v3(&repo, merge_commit_sha).is_ok()
+    {
         return Ok(());
     }
 
@@ -885,7 +890,10 @@ fn recover_rewritten_mr_notes(
 /// Query GitLab API for the MR that produced the current commit and build a
 /// merge context for it. Returns None if no matching MR is found (this is not an
 /// error - just means this commit wasn't from a merged MR).
-pub fn get_gitlab_ci_context(skip_push: bool) -> Result<Option<CiContext>, GitAiError> {
+pub fn get_gitlab_ci_context(
+    skip_push: bool,
+    recompute_existing: bool,
+) -> Result<Option<CiContext>, GitAiError> {
     let project_id = std::env::var("CI_PROJECT_ID").map_err(|_| {
         GitAiError::Generic("CI_PROJECT_ID environment variable not set".to_string())
     })?;
@@ -1041,6 +1049,7 @@ pub fn get_gitlab_ci_context(skip_push: bool) -> Result<Option<CiContext>, GitAi
             fetch_url: fork_clone_url.as_deref().unwrap_or(&urls.fetch),
             fork_clone_url: fork_clone_url.as_deref(),
             skip_push,
+            recompute_existing,
         },
     )?;
 
@@ -2112,6 +2121,7 @@ mod tests {
                 fetch_url: "https://unreachable.invalid/x.git",
                 fork_clone_url: None,
                 skip_push: true,
+                recompute_existing: false,
             },
         )
         .unwrap();
@@ -2140,6 +2150,7 @@ mod tests {
                 fetch_url: "https://unreachable.invalid/x.git",
                 fork_clone_url: None,
                 skip_push: true,
+                recompute_existing: false,
             },
         )
         .unwrap();
