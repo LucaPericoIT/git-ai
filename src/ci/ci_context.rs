@@ -78,6 +78,9 @@ pub struct CiRunOptions {
     pub skip_fetch_fork_notes: bool,
     pub skip_fetch_sync_refs: bool,
     pub skip_push: bool,
+    /// Rebuild the merge commit's note even when it already has one, unioning
+    /// the existing note into the result so no attributed line is dropped.
+    pub recompute_existing: bool,
 }
 
 #[derive(Debug)]
@@ -125,6 +128,12 @@ impl CiContext {
 
                 // Check if authorship already exists for this commit
                 match read_authorship_v3(&self.repo, merge_commit_sha) {
+                    Ok(_) if options.recompute_existing => {
+                        println!(
+                            "{} already has authorship; recomputing it",
+                            merge_commit_sha
+                        );
+                    }
                     Ok(existing_log) => {
                         println!("{} already has authorship", merge_commit_sha);
                         return Ok(CiRunResult::AlreadyExists {

@@ -135,11 +135,17 @@ fn handle_ci_gitlab(args: &[String]) {
     match args[0].as_str() {
         "run" => {
             let no_cleanup = args[1..].iter().any(|a| a == "--no-cleanup");
+            let recompute_existing = args[1..].iter().any(|a| a == "--recompute-existing")
+                || std::env::var("GIT_AI_CI_FORCE_RECOMPUTE")
+                    .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
             let ci_context = get_gitlab_ci_context();
             match ci_context {
                 Ok(Some(ci_context)) => {
                     tracing::debug!("GitLab CI context: {:?}", ci_context);
-                    match ci_context.run() {
+                    match ci_context.run_with_options(CiRunOptions {
+                        recompute_existing,
+                        ..Default::default()
+                    }) {
                         Ok(result) => {
                             tracing::debug!("GitLab CI result: {:?}", result);
                             print_ci_result(&result, "GitLab CI");
@@ -288,6 +294,7 @@ fn handle_ci_local(args: &[String]) {
                 skip_fetch_fork_notes,
                 skip_fetch_sync_refs: false,
                 skip_push,
+                recompute_existing: false,
             }) {
                 Ok(result) => {
                     tracing::debug!("Local CI result: {:?}", result);
@@ -362,6 +369,7 @@ fn handle_ci_local(args: &[String]) {
                 skip_fetch_fork_notes: false,
                 skip_fetch_sync_refs,
                 skip_push,
+                recompute_existing: false,
             }) {
                 Ok(result) => {
                     tracing::debug!("Local CI result: {:?}", result);
@@ -450,8 +458,13 @@ fn print_ci_gitlab_help_and_exit() -> ! {
     eprintln!("Usage: git-ai ci gitlab <subcommand> [args...]");
     eprintln!();
     eprintln!("Subcommands:");
-    eprintln!("  run [--no-cleanup]   Run GitLab CI in current repo");
+    eprintln!("  run [--no-cleanup] [--recompute-existing]");
+    eprintln!("                       Run GitLab CI in current repo");
     eprintln!("                       --no-cleanup  Skip teardown after run");
+    eprintln!(
+        "                       --recompute-existing  Rebuild a merge note that already exists \
+         (also GIT_AI_CI_FORCE_RECOMPUTE=1)"
+    );
     eprintln!("  install              Print YAML snippet to add to .gitlab-ci.yml");
     std::process::exit(1);
 }
